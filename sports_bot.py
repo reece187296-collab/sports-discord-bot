@@ -1,11 +1,6 @@
 import os
-import re
 import json
-import hashlib
 import requests
-import pytesseract
-from PIL import Image, ImageEnhance, ImageFilter
-from io import BytesIO
 
 DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -21,10 +16,7 @@ def load_state():
         except:
             pass
 
-    return {
-        "offset": 0,
-        "processed": []
-    }
+    return {"offset": 0}
 
 
 def save_state(state):
@@ -39,130 +31,161 @@ def telegram_api(method, params=None):
     return response.json()
 
 
-def download_telegram_image(file_id):
-    file_info = telegram_api("getFile", {"file_id": file_id})
+def send_discord(content=None, file_bytes=None, filename=None):
+    if file_bytes:
+        files = {
+            "file": (
+                filename or "telegram_file",
+                file_bytes
+            )
+        }
 
-    file_path = file_info["result"]["file_path"]
+        data = {}
+
+        if content:
+            data["content"] = content
+
+        response = requests.post(
+            DISCORD_WEBHOOK,
+            data=data,
+            files=files,
+            timeout=60
+        )
+    else:
+        response = requests.post(
+            DISCORD_WEBHOOK,
+            json={"content": content or ""},
+            timeout=30
+        )
+
+    response.raise_for_status()
+
+
+def download_file(file_id):
+    info = telegram_api(
+        "getFile",
+        {"file_id": file_id}
+    )
+
+    file_path = info["result"]["file_path"]
 
     url = (
         f"https://api.telegram.org/file/bot"
         f"{TELEGRAM_BOT_TOKEN}/{file_path}"
     )
 
-    response = requests.get(url, timeout=60)
-    response.raise_for_status()
-
-    return Image.open(BytesIO(response.content))
-
-
-def improve_image(image):
-    image = image.convert("L")
-
-    # Make the text larger
-    width, height = image.size
-    image = image.resize((width * 2, height * 2))
-
-    # Improve contrast
-    image = ImageEnhance.Contrast(image).enhance(2)
-
-    # Sharpen
-    image = image.filter(ImageFilter.SHARPEN)
-
-    return image
-
-
-def clean_ocr_text(text):
-    lines = []
-
-    for line in text.splitlines():
-        line = line.strip()
-
-        if not line:
-            continue
-
-        # Remove excessive spaces
-        line = re.sub(r"[ \t]+", " ", line)
-
-        lines.append(line)
-
-    return "\n".join(lines)
-
-
-def send_to_discord(text):
-    payload = {
-        "content": text
-    }
-
-    response = requests.post(
-        DISCORD_WEBHOOK,
-        json=payload,
-        timeout=30
+    response = requests.get(
+        url,
+        timeout=60
     )
 
     response.raise_for_status()
 
-
-def process_image(file_id):
-    print("Downloading Telegram picture...")
-
-    image = download_telegram_image(file_id)
-
-    print("Running OCR...")
-
-    image = improve_image(image)
-
-    text = pytesseract.image_to_string(
-        image,
-        config="--psm 6"
-    )
-
-    text = clean_ocr_text(text)
-
-    if not text:
-        print("No text found in picture.")
-        return False
-
-    print("OCR result:")
-    print(text)
-
-    discord_message = (
-        "📺 **SPORTS LISTING OCR**\n\n"
-        f"```text\n{text}\n```"
-    )
-
-    send_to_discord(discord_message)
-
-    print("Sent OCR text to Discord.")
-
-    return True
+    return response.content, file_path
 
 
-def get_image_file_id(message):
-    # Telegram normal picture
+def process_message(message):
+    # Text
+    text = message.get("text")
+
+    if text:
+        send_discord(text)
+
+    # Caption attached to picture/video/file
+    caption = message.get("caption")
+
+    # Picture
     if message.get("photo"):
-        return message["photo"][-1]["file_id"]
+        photo = message["photo"][-1]
 
-    # Telegram image sent as a document
-    document = message.get("document")
+        file_id = photo["file_id"]
 
-    if document:
-        mime_type = document.get("mime_type", "")
+        file_bytes, file_path = download_file(file_id)
 
-        if mime_type.startswith("image/"):
-            return document["file_id"]
+        filename = os.path.basename(file_path)
 
-    return None
+        send_discord(
+            content=caption,
+            file_bytes=file_bytes,
+            filename=filename
+        )
+
+    # Video
+    elif message.get("video"):
+        video = message["video"]
+
+        file_id = video["file_id"]
+
+        file_bytes, file_path = download_file(file_id)
+
+        filename = os.path.basename(file_path)
+
+        send_discord(
+            content=caption,
+            file_bytes=file_bytes,
+            filename=filename
+        )
+
+    # Document / other file
+    elif message.get("document"):
+        document = message["document"]
+
+        file_id = document["file_id"]
+
+        file_bytes, file_path = download_file(file_id)
+
+        filename = document.get(
+            "file_name",
+            os.path.basename(file_path)
+        )
+
+        send_discord(
+            content=caption,
+            file_bytes=file_bytes,
+            filename=filename
+        )
+
+    # Audio
+    elif message.get("audio"):
+        audio = message["audio"]
+
+        file_id = audio["file_id"]
+
+        file_bytes, file_path = download_file(file_id)
+
+        filename = os.path.basename(file_path)
+
+        send_discord(
+            content=caption,
+            file_bytes=file_bytes,
+            filename=filename
+        )
+
+    # Voice message
+    elif message.get("voice"):
+        voice = message["voice"]
+
+        file_id = voice["file_id"]
+
+        file_bytes, file_path = download_file(file_id)
+
+        filename = os.path.basename(file_path)
+
+        send_discord(
+            content=caption,
+            file_bytes=file_bytes,
+            filename=filename
+        )
 
 
 def main():
     state = load_state()
 
     offset = state.get("offset", 0)
-    processed = state.get("processed", [])
 
     print("Checking Telegram...")
 
-    data = telegram_api(
+    updates = telegram_api(
         "getUpdates",
         {
             "offset": offset,
@@ -171,11 +194,9 @@ def main():
                 ["message", "channel_post"]
             )
         }
-    )
+    ).get("result", [])
 
-    updates = data.get("result", [])
-
-    print(f"Found {len(updates)} Telegram update(s).")
+    print(f"Found {len(updates)} update(s).")
 
     for update in updates:
 
@@ -186,41 +207,14 @@ def main():
             or update.get("channel_post")
         )
 
-        if not message:
-            state["offset"] = update_id + 1
-            continue
-
-        file_id = get_image_file_id(message)
-
-        if not file_id:
-            state["offset"] = update_id + 1
-            continue
-
-        # Create a fingerprint so the same picture isn't sent twice
-        fingerprint = hashlib.sha256(
-            file_id.encode()
-        ).hexdigest()
-
-        if fingerprint in processed:
-            print("Picture already processed.")
-            state["offset"] = update_id + 1
-            continue
-
-        try:
-            success = process_image(file_id)
-
-            if success:
-                processed.append(fingerprint)
-
-                # Keep state file small
-                processed = processed[-200:]
-
-        except Exception as e:
-            print(f"Error processing picture: {e}")
+        if message:
+            try:
+                process_message(message)
+                print("Sent Telegram message to Discord.")
+            except Exception as e:
+                print(f"Error: {e}")
 
         state["offset"] = update_id + 1
-
-    state["processed"] = processed
 
     save_state(state)
 

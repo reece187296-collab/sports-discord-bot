@@ -9,81 +9,95 @@ from zoneinfo import ZoneInfo
 
 DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
 
-THESPORTSDB_KEY = "123"
+API_KEY = "123"
 
 UK_TIMEZONE = ZoneInfo("Europe/London")
 
 # =========================
-# GET TODAY'S SPORTS
+# TODAY'S DATE
 # =========================
 
 today = datetime.now(UK_TIMEZONE).strftime("%Y-%m-%d")
 
+# =========================
+# GET UK SPORTS TV LISTINGS
+# =========================
+
 url = (
     f"https://www.thesportsdb.com/api/v1/json/"
-    f"{THESPORTSDB_KEY}/eventsday.php?d={today}"
+    f"{API_KEY}/eventstv.php"
 )
 
-response = requests.get(url, timeout=30)
+params = {
+    "d": today,
+    "a": "United_Kingdom"
+}
+
+response = requests.get(
+    url,
+    params=params,
+    timeout=30
+)
+
 response.raise_for_status()
 
 data = response.json()
 
-events = data.get("events") or []
+events = data.get("tvevents") or []
 
 # =========================
 # BUILD DISCORD MESSAGE
 # =========================
 
-if not events:
-    description = (
-        f"No sports events were found for {today}."
+lines = []
+
+for event in events:
+
+    sport = event.get("strSport", "Sport")
+    event_name = event.get("strEvent", "Sports event")
+    channel = event.get("strChannel", "Channel not listed")
+
+    event_date = event.get("dateEvent", "")
+    event_time = event.get("strTime", "")
+
+    uk_time = "Time not listed"
+
+    if event_date and event_time:
+
+        try:
+            event_datetime = datetime.fromisoformat(
+                f"{event_date}T{event_time}"
+            )
+
+            uk_time = event_datetime.strftime("%H:%M")
+
+        except ValueError:
+            uk_time = event_time[:5]
+
+    lines.append(
+        f"**{sport}**\n"
+        f"🎟️ {event_name}\n"
+        f"🕐 {uk_time} UK\n"
+        f"📺 {channel}"
     )
+
+# =========================
+# NOTHING FOUND
+# =========================
+
+if not lines:
+
+    description = (
+        f"No UK sports TV listings were found for "
+        f"{today}."
+    )
+
 else:
-    lines = []
-
-    for event in events:
-
-        sport = event.get("strSport", "Sport")
-        league = event.get("strLeague", "")
-        home = event.get("strHomeTeam", "")
-        away = event.get("strAwayTeam", "")
-
-        event_name = event.get("strEvent", "")
-
-        if home and away:
-            matchup = f"{home} vs {away}"
-        elif event_name:
-            matchup = event_name
-        else:
-            matchup = "Sports event"
-
-        date_event = event.get("dateEvent", "")
-        time_event = event.get("strTime", "")
-
-        uk_time = "Time unavailable"
-
-        if date_event and time_event:
-            try:
-                event_time = datetime.fromisoformat(
-                    f"{date_event}T{time_event}"
-                )
-
-                uk_time = event_time.strftime("%H:%M")
-
-            except ValueError:
-                uk_time = time_event[:5]
-
-        line = f"**{sport}** — {matchup}\n"
-
-        if league:
-            line += f"🏆 {league}\n"
-
-        line += f"🕐 UK time: **{uk_time}**"
-
-        lines.append(line)
 
     description = "\n\n".join(lines)
+
+# Discord embeds have a description limit.
+description = description[:4000]
 
 # =========================
 # SEND TO DISCORD
@@ -92,10 +106,10 @@ else:
 message = {
     "embeds": [
         {
-            "title": "🇬🇧 UK Sports — Today",
-            "description": description[:4000],
+            "title": "🇬🇧 UK Sports TV Listings",
+            "description": description,
             "footer": {
-                "text": "Sports data provided by TheSportsDB"
+                "text": "Listings provided by TheSportsDB"
             }
         }
     ]
@@ -109,4 +123,4 @@ discord_response = requests.post(
 
 discord_response.raise_for_status()
 
-print("UK Sports update successfully sent to Discord!")
+print("UK Sports TV listings sent successfully!")

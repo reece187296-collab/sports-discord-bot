@@ -1,126 +1,231 @@
 import os
+import re
+import json
+import hashlib
 import requests
-from datetime import datetime
-from zoneinfo import ZoneInfo
-
-# =========================
-# SETTINGS
-# =========================
+import pytesseract
+from PIL import Image, ImageEnhance, ImageFilter
+from io import BytesIO
 
 DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 
-API_KEY = "123"
+STATE_FILE = "telegram_state.json"
 
-UK_TIMEZONE = ZoneInfo("Europe/London")
 
-# =========================
-# TODAY'S DATE
-# =========================
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except:
+            pass
 
-today = datetime.now(UK_TIMEZONE).strftime("%Y-%m-%d")
+    return {
+        "offset": 0,
+        "processed": []
+    }
 
-# =========================
-# GET UK SPORTS TV LISTINGS
-# =========================
 
-url = (
-    f"https://www.thesportsdb.com/api/v1/json/"
-    f"{API_KEY}/eventstv.php"
-)
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
 
-params = {
-    "d": today,
-    "a": "United_Kingdom"
-}
 
-response = requests.get(
-    url,
-    params=params,
-    timeout=30
-)
+def telegram_api(method, params=None):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    response = requests.get(url, params=params or {}, timeout=30)
+    response.raise_for_status()
+    return response.json()
 
-response.raise_for_status()
 
-data = response.json()
+def download_telegram_image(file_id):
+    file_info = telegram_api("getFile", {"file_id": file_id})
 
-events = data.get("tvevents") or []
+    file_path = file_info["result"]["file_path"]
 
-# =========================
-# BUILD DISCORD MESSAGE
-# =========================
+    url = (
+        f"https://api.telegram.org/file/bot"
+        f"{TELEGRAM_BOT_TOKEN}/{file_path}"
+    )
 
-lines = []
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
 
-for event in events:
+    return Image.open(BytesIO(response.content))
 
-    sport = event.get("strSport", "Sport")
-    event_name = event.get("strEvent", "Sports event")
-    channel = event.get("strChannel", "Channel not listed")
 
-    event_date = event.get("dateEvent", "")
-    event_time = event.get("strTime", "")
+def improve_image(image):
+    image = image.convert("L")
 
-    uk_time = "Time not listed"
+    # Make the text larger
+    width, height = image.size
+    image = image.resize((width * 2, height * 2))
 
-    if event_date and event_time:
+    # Improve contrast
+    image = ImageEnhance.Contrast(image).enhance(2)
+
+    # Sharpen
+    image = image.filter(ImageFilter.SHARPEN)
+
+    return image
+
+
+def clean_ocr_text(text):
+    lines = []
+
+    for line in text.splitlines():
+        line = line.strip()
+
+        if not line:
+            continue
+
+        # Remove excessive spaces
+        line = re.sub(r"[ \t]+", " ", line)
+
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
+def send_to_discord(text):
+    payload = {
+        "content": text
+    }
+
+    response = requests.post(
+        DISCORD_WEBHOOK,
+        json=payload,
+        timeout=30
+    )
+
+    response.raise_for_status()
+
+
+def process_image(file_id):
+    print("Downloading Telegram picture...")
+
+    image = download_telegram_image(file_id)
+
+    print("Running OCR...")
+
+    image = improve_image(image)
+
+    text = pytesseract.image_to_string(
+        image,
+        config="--psm 6"
+    )
+
+    text = clean_ocr_text(text)
+
+    if not text:
+        print("No text found in picture.")
+        return False
+
+    print("OCR result:")
+    print(text)
+
+    discord_message = (
+        "📺 **SPORTS LISTING OCR**\n\n"
+        f"```text\n{text}\n```"
+    )
+
+    send_to_discord(discord_message)
+
+    print("Sent OCR text to Discord.")
+
+    return True
+
+
+def get_image_file_id(message):
+    # Telegram normal picture
+    if message.get("photo"):
+        return message["photo"][-1]["file_id"]
+
+    # Telegram image sent as a document
+    document = message.get("document")
+
+    if document:
+        mime_type = document.get("mime_type", "")
+
+        if mime_type.startswith("image/"):
+            return document["file_id"]
+
+    return None
+
+
+def main():
+    state = load_state()
+
+    offset = state.get("offset", 0)
+    processed = state.get("processed", [])
+
+    print("Checking Telegram...")
+
+    data = telegram_api(
+        "getUpdates",
+        {
+            "offset": offset,
+            "timeout": 10,
+            "allowed_updates": json.dumps(
+                ["message", "channel_post"]
+            )
+        }
+    )
+
+    updates = data.get("result", [])
+
+    print(f"Found {len(updates)} Telegram update(s).")
+
+    for update in updates:
+
+        update_id = update["update_id"]
+
+        message = (
+            update.get("message")
+            or update.get("channel_post")
+        )
+
+        if not message:
+            state["offset"] = update_id + 1
+            continue
+
+        file_id = get_image_file_id(message)
+
+        if not file_id:
+            state["offset"] = update_id + 1
+            continue
+
+        # Create a fingerprint so the same picture isn't sent twice
+        fingerprint = hashlib.sha256(
+            file_id.encode()
+        ).hexdigest()
+
+        if fingerprint in processed:
+            print("Picture already processed.")
+            state["offset"] = update_id + 1
+            continue
 
         try:
-            event_datetime = datetime.fromisoformat(
-                f"{event_date}T{event_time}"
-            )
+            success = process_image(file_id)
 
-            uk_time = event_datetime.strftime("%H:%M")
+            if success:
+                processed.append(fingerprint)
 
-        except ValueError:
-            uk_time = event_time[:5]
+                # Keep state file small
+                processed = processed[-200:]
 
-    lines.append(
-        f"**{sport}**\n"
-        f"🎟️ {event_name}\n"
-        f"🕐 {uk_time} UK\n"
-        f"📺 {channel}"
-    )
+        except Exception as e:
+            print(f"Error processing picture: {e}")
 
-# =========================
-# NOTHING FOUND
-# =========================
+        state["offset"] = update_id + 1
 
-if not lines:
+    state["processed"] = processed
 
-    description = (
-        f"No UK sports TV listings were found for "
-        f"{today}."
-    )
+    save_state(state)
 
-else:
+    print("Finished.")
 
-    description = "\n\n".join(lines)
 
-# Discord embeds have a description limit.
-description = description[:4000]
-
-# =========================
-# SEND TO DISCORD
-# =========================
-
-message = {
-    "embeds": [
-        {
-            "title": "🇬🇧 UK Sports TV Listings",
-            "description": description,
-            "footer": {
-                "text": "Listings provided by TheSportsDB"
-            }
-        }
-    ]
-}
-
-discord_response = requests.post(
-    DISCORD_WEBHOOK,
-    json=message,
-    timeout=30
-)
-
-discord_response.raise_for_status()
-
-print("UK Sports TV listings sent successfully!")
+if __name__ == "__main__":
+    main()

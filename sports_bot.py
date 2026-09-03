@@ -2,7 +2,7 @@ import os
 import requests
 from datetime import datetime, timezone
 
-DISCORD_WEBHOOK = os.environ["https://discord.com/api/webhooks/1545042996767105144/mlJpwovcnRrUsQ7n49qNgKdi4sTbMAGqDAL28BbGg_WMDA-CWVxvWCigwBZEO1TlH--M"]
+DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
 
 # Simple test message
 message = {
